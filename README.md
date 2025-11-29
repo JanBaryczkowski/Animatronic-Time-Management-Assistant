@@ -1,7 +1,5 @@
 1. Project overview
-The Animatronic Time Management Assistant is a mechatronic device that combines animatronics, computer vision, voice interaction, and scheduling tools into an interactive desktop companion. It supports daily time-management tasks through physical movement, face tracking, and a graphical display interface.
-
-This project is developed as part of my Engineering Thesis (Bachelor’s Degree Project) at Poznan University of Technology, under the supervision of dr hab. inż. Dominik Rybarczyk.
+The Animatronic Time Management Assistant is a mechatronic device that combines animatronics, computer vision, voice interaction, and scheduling tools into an interactive desktop companion. It supports daily time-management tasks through physical movement, face tracking, and a graphical display interface. This project is developed as part of my Engineering Thesis (Bachelor’s Degree Project) at Poznan University of Technology, under the supervision of dr hab. inż. Dominik Rybarczyk.
 
 2. Features
 - Graphical schedule display – calendar, reminders, daily agenda shown on a 7” QLED 1024×600 screen
