@@ -1,0 +1,102 @@
+from vosk import Model, KaldiRecognizer  
+import pyaudio
+import json
+import os  
+import numpy as np
+import pygame
+import threading
+import time
+
+# ładowanie modelu
+vosk = "/home/Jan/vosk/model-pl"  # string zawierający ścieżkę do modelu
+model = Model(vosk)  # wczytuje model językowy z dysku
+translator = KaldiRecognizer(model, 16000)  # przetwarza rzeczywisty dźwięk na tekst (parametry: model i częstotliwość próbkowania w hz)
+
+# audio input
+audio_on = pyaudio.PyAudio()  # tworzymy obiekt klasy do nagrywania i odtwarzania dźwięku
+stream = audio_on.open(
+    format=pyaudio.paInt16,  # 16-bitowe próbki dźwięku
+    channels=1,  # mono do rozpoznawania, dwa kanały nie są potrzebne
+    rate=16000,
+    input=True,
+    frames_per_buffer=8000  # ile próbek odczytujemy na raz
+)
+stream.start_stream()  # funkcja stream włącza aktywne nagrywanie audio
+
+# flaga do animacji
+speaking = False
+
+# funkcja do mówienia
+def speak(text):
+    global speaking
+    speaking = True  # włącza animację podczas mowy
+    os.system(f'espeak-ng -v pl "{text}"')  # python wywołuje komendę w terminalu
+    speaking = False  # wyłącza animację po zakończeniu mowy
+
+# funkcja nasłuchu w oddzielnym wątku
+def listen_loop():
+    while True:
+        data = stream.read(4000, exception_on_overflow=False)  # 4000 to odczyt z bufora 8000, brak dzialania przy overflowu
+        if translator.AcceptWaveform(data): #przetwarza fragment audio przez vosk
+            result = json.loads(translator.Result()) ##result -zwraca wynik rozpoznawania w formacie JSON json.loads konwertuje JSON na słownik Pythona:
+            text = result.get("text", "")
+            print("usłyszałem:", text)
+
+            if not text:  # jeśli cisza lub brak rozpoznanego słowa, nic nie mówimy
+                continue
+            # reagujemy tylko na faktyczne słowa
+            if "dzień dobry" in text:
+                speak("dzień dobry! jak mogę pomóc?")
+            elif "stop" in text:
+                speak("zatrzymuję działanie.")
+                break
+            elif "jak się czujesz" in text.lower():
+                speak("a bardzo dobrze, mam nadzieję, że ty również")
+            elif "czy możesz włączyć kalendarz?" in text.lower():
+                speak("jasne, już uruchamiam")
+            else:
+                speak("nie zrozumiałem")  # wypowiadamy tylko przy nieznanych słowach
+
+# uruchamiamy nasłuch w wątku
+thread = threading.Thread(target=listen_loop) #threading z biblioteki, Thread klasa w tej biblio sluzy do tworzenia nowego watku, w () argument ktory mowi ktura funkcje ma wykonac w watku
+thread.start() # metoda klasy thread start dziala rownolegle do glownej petli w tym przpyadku animacji w pygame
+
+# inicjalizacja pygame fullscreen
+pygame.init() #biblioteka pygame, init() tworzy i iniclaizuje grafike dzwiek zagary itd co chcemy
+info = pygame.display.Info() #funcka z modulu pygame.display ktora zwraca info o ekranie
+width, height = info.current_w, info.current_h # atrybuty obiektu info() ktore pobieraja konkreta wysokosc  szerokosc
+screen = pygame.display.set_mode((width, height), pygame.FULLSCREEN)  #  mowi za siebie
+pygame.display.set_caption("Fala Audio") # tytlul okna i tak go niw widac
+clock = pygame.time.Clock() # klasa clock pozwala kontrolowac liczbe klatek na sekunde ktora pozniej ustawimy
+
+# generujemy dane do fali
+x = np.linspace(0, 4*np.pi, width) #np alias, linspace tworzy jednowumirowa tablice, miedzy 0 a 4 pelene okresy sunosidy, width zeby linia byl od lewej do prawej
+
+# Zmienne od głównej pętli
+current_amplitude = 10  # bieżąca amplituda fali
+target_amplitude = 10  # docelowa amplituda fali
+
+running = True
+while running:
+    for x in pygame.x.get():  # obsługa zdarzeń pygame; funkcja z pygame ktora zwraca liste wszystkich zdarzen
+        if x.type == pygame.QUIT: # stala oznacza ze zamknelismy okno
+            running = False
+
+    screen.fill((0, 0, 0))  # metoda obiektu screen przez pygame.dispal.set mode a 000 oznacza czarny w rhb
+
+    # ustawiamy docelową amplitudę w zależności od mowy
+    target_amplitude = 60 if speaking else 10
+    current_amplitude += (target_amplitude - current_amplitude) * 0.05  # płynna zmiana amplitudy
+
+    # generujemy „realistyczny” dźwiękowy szum
+    robot_speak = np.random.normal(0, current_amplitude, width)  # szum rośnie przy mowie
+    move_mouth = height//2 + np.roll(robot_speak, int(time.time()))  # przesunięcie szumu w czasie dla efektu fali
+
+    # rysowanie linii
+    points = [(i, int(move_mouth[i])) for i in range(width)] #i to punkt x, move mouth to punkt y, punkt y sie zmienia zaleznie od amplitudy, a i tez sie zmienia zaleznie od szerokosci ekranu
+    pygame.draw.lines(screen, (0, 255, 0), False, points, 2)  # zielona linia zrgb ktora laczy teraz wszystkie punkty - obraz, kolor, nie zamykamy linii, laczymy punkty, grubosc linii
+
+    pygame.display.flip()  # aktualizacja ekranu
+    clock.tick(60)  # 60 fps
+
+pygame.quit()  # zamyka pygame po wyjściu z pętli
