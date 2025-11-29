@@ -1,0 +1,293 @@
+import cv2               
+import time               
+import random             
+import board              
+import busio              
+import mediapipe as mp    
+from adafruit_pca9685 import PCA9685  
+import pigpio
+
+# obiekt I2C do komunikacji z PCA9685
+i2c = busio.I2C(board.SCL, board.SDA)  
+pca = PCA9685(i2c)                     
+pca.frequency = 50                      
+
+pi=pigpio.pi()
+NECK_PIN = 13
+pi.set_PWM_frequency(NECK_PIN, 1500)
+
+def angle_pwm(angle):
+    pos_us = 500 + (angle / 180) * 2000  # zamiana kąta w µs: 0°=500µs, 180°=2500µs
+    pos_pca = int((pos_us / 20000) * 65535)  # 20ms = 50Hz, przeliczamy na 0-65535
+    return pos_pca
+
+# przypisanie nazw serw do konkretnych kanałów PCA9685
+servo_channels = {
+    "LeftRight": 0,
+    "UpDown": 1,
+    "BotLeft": 2,  # im mniej tym wyzej
+    "TopLeft": 3,  # im mniej tym wyzej
+    "BotRight": 4,  # im wiecej tym wyzej
+    "TopRight": 5, #im wiecej tym wyzej
+    "Neck": 15,
+}
+# ograniczenia kątów dla każdego serwa (min, max)
+tracking_limits = {
+    "LeftRight": (0, 180),   # lewo/prawo
+    "UpDown": (40, 100),      # góra/dół
+    "BotLeft": (80, 150),     # powieka dolna lewa
+    "TopLeft": (70, 20),  # powieka górna lewa (odwrotna)
+    "BotRight": (100, 30),    # powieka dolna prawa (odwrotna)
+    "TopRight": (110, 160),    # powieka górna prawa
+
+}
+# limity do mrugania
+blink_limits = {
+    "TopLeft": (60, 90),
+    "BotLeft": (70, 95),
+    "TopRight": (90, 130),
+    "BotRight": (80, 110)
+}
+# aktualne pozycje serw
+servo_targets = {
+    "LeftRight": 90,
+    "UpDown": 65,
+    "BotLeft": 60,
+    "TopLeft": 110,
+    "BotRight": 120,
+    "TopRight": 110,
+
+}
+# funkcja ustawiająca serwa
+def set_servo(name, angle):
+    min_a, max_a = tracking_limits[name]
+    if min_a < max_a:
+        angle = max(min_a, min(max_a, angle))  #clamp
+    else:
+        angle = min(min_a, max(max_a, angle))
+    servo_targets[name] = angle  #
+    pca.channels[servo_channels[name]].duty_cycle = angle_pwm(angle)
+
+# ustawianie mrugania
+def set_servo_blink(name, angle):
+    min_a, max_a = blink_limits[name]
+    if min_a < max_a:
+        angle = max(min_a, min(max_a, angle))
+    else:
+        angle = min(min_a, max(max_a, angle))
+    set_servo(name, angle)
+    pca.channels[servo_channels[name]].duty_cycle = angle_pwm(angle)
+
+# wyowałaniue mrugania
+def blink():
+    set_servo_blink("TopRight", 90)
+    set_servo_blink("BotRight", 100)
+    set_servo_blink("TopLeft", 90)
+    set_servo_blink("BotLeft", 80)
+    time.sleep(0.3)
+
+#  ustawiania limitów od powiek
+def lid_limit(lid_value, name):
+    min_a, max_a = tracking_limits[name]
+    if min_a < max_a:
+        return max(min_a, min(max_a, lid_value))
+    else:
+        return min(min_a, max(max_a, lid_value))
+
+# kalibracja
+def calibrate():
+    set_servo("LeftRight", eye_x)
+    set_servo("UpDown", eye_y)
+    set_servo("TopLeft", lid_1)
+    set_servo("BotRight", lid_4)
+    set_servo("TopRight", lid_2)
+    set_servo("BotLeft", lid_3)
+
+# otwieranie oczu
+def eyes_open():
+    set_servo("TopRight", 140)
+    set_servo("BotRight", 60)
+    set_servo("TopLeft", 40)
+    set_servo("BotLeft", 120)
+    time.sleep(1)
+# animacja na start 
+def lookout():
+    eyes_open()
+    blink()
+    eyes_open()
+    blink()
+    eyes_open()
+    set_servo("LeftRight", 60)
+    time.sleep(1)
+    blink()
+    eyes_open()
+    set_servo("LeftRight", 120)
+    time.sleep(1)
+    blink()
+    eyes_open()
+    set_servo("LeftRight", 90)
+
+mp_face = mp.solutions.face_detection  # obiekt modułu wykrywania twarzy
+face_detection = mp_face.FaceDetection(
+    model_selection=0,               # model_selection=0 - zdjęcia z bliska
+    min_detection_confidence=0.6     # minimalna pewność detekcji
+)
+
+cap = cv2.VideoCapture(0)  
+cap.set(3, 1280)            
+cap.set(4, 720)            
+
+
+
+# ustawianie oczu
+eye_x = 90           # początkowy kąt w osi X (lewo-prawo)
+eye_y = 65           # początkowy kąt w osi Y (góra-dół)
+lid_1 = 40           # TopLeft
+lid_2 = 140           # TopRight
+lid_3 = 120           # BotLeft
+lid_4 = 60           # BotRight
+Kp = 0.09            # współczynnik proporcjonalny do ruchu oczu (P-regulator)
+
+
+last_blink = time.time()           # zapis czasu ostatniego mrugnięcia
+next_blink = random.uniform(3, 6) # losowy czas do kolejnego mrugnięcia (3-6s)
+
+calibrate()
+
+pi.set_servo_pulsewidth(NECK_PIN, 1500)
+neck_timer = None
+neck_moving = False
+neck_wait_timer = None
+neck_move_start = 0
+OFFSET_DELAY = 3  # czas offsetu wymagany do startu ruchu [s]
+NECK_MOVE_DURATION = 0.5  # czas ruchu szyi [s]
+neck_position = 1500
+
+while True:
+    ret, frame = cap.read()  # ret sprawdza czy jest true - kamera dziala, frame pobiera obraz, a cap.read() wlasnie odpowiada za to sprawdzenie
+    if not ret:
+        break  
+
+    # konwersja BGR -> RGB, MediaPipe wymaga RGB
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # przetwarzanie klatki w MediaPipe (detekcja twarzy)
+    results = face_detection.process(frame_rgb)
+
+    h, w, _ = frame.shape      # wysokość, szerokość, liczba kanałów - nie ma znacenia wiec _
+    cx, cy = w // 2, h // 2    # środek obrazu - punkt odniesienia, dzielenie calkowite
+
+    if results.detections:     # jeśli wykryto twarz
+        detection = results.detections[0]  # bierzemy pierwszą twarz
+        bbox = detection.location_data.relative_bounding_box  # współrzędne prostokąta w relatywnych wartościach (0-1)
+
+        # przeliczenie współrzędnych na piksele
+        face_x = int((bbox.xmin + bbox.width / 2) * w)
+        face_y = int((bbox.ymin + bbox.height / 2) * h)
+
+        # obliczenie błędu w położeniu twarzy względem środka
+        error_x = cx - face_x
+        error_y = cy - face_y
+
+        # aktualizacja pozycji oczu 
+        eye_x += int(Kp * error_x)  # ruch w osi X
+        eye_y -= int(Kp * error_y)  # ruch w osi Y (minus bo odwrócone kierunki)
+        lid_1 -= int(Kp * error_y)  # powieki w osi y
+        lid_2 += int(Kp * error_y)
+        lid_3 -= int(Kp * error_y)
+        lid_4 += int(Kp * error_y)
+
+        # ograniczenie ruchu oczu do zakresów serw
+        eye_x = max(tracking_limits["LeftRight"][0], min(tracking_limits["LeftRight"][1], eye_x))
+        eye_y = max(tracking_limits["UpDown"][0], min(tracking_limits["UpDown"][1], eye_y))
+        lid_1 = lid_limit(lid_1, "TopLeft")
+        lid_2 = lid_limit(lid_2, "TopRight")
+        lid_3 = lid_limit(lid_3, "BotLeft")
+        lid_4 = lid_limit(lid_4, "BotRight")
+
+        # wysyłanie wartości do serw
+        set_servo("LeftRight", eye_x)
+        set_servo("UpDown", eye_y)
+        set_servo("TopLeft", lid_1)
+        set_servo("BotRight", lid_4)
+        set_servo("TopRight", lid_2)
+        set_servo("BotLeft", lid_3)
+
+        servo_targets["LeftRight"] = eye_x
+        servo_targets["UpDown"] = eye_y
+        servo_targets["TopLeft"] = lid_1
+        servo_targets["BotRight"] = lid_4
+        servo_targets["TopRight"] = lid_2
+        servo_targets["BotLeft"] = lid_3
+
+        # wizu w opoen cv - prostokat od twarzy
+        cv2.rectangle(frame,
+                      (int(bbox.xmin * w), int(bbox.ymin * h)),
+                      (int((bbox.xmin + bbox.width) * w), int((bbox.ymin + bbox.height) * h)),
+                      (0, 255, 0), 2)
+        cv2.circle(frame, (face_x, face_y), 5, (0, 0, 255), -1)
+    else:
+        # brak twarzy - oczy powoli wracają do neutralnej pozycji   - TU POPRAWIC WARTOSCI!!!!!
+        eye_x += int((90 - eye_x) * Kp)
+        eye_y -= int((90 - eye_y) * Kp)
+        lid_1 -= int((90 - lid_1) * Kp)
+        lid_2 += int((90 - lid_2) * Kp)
+        lid_3 -= int((90 - lid_3) * Kp)
+        lid_4 += int((90 - lid_4) * Kp)
+
+        set_servo("LeftRight", eye_x)
+        set_servo("UpDown", eye_y)
+        set_servo("TopLeft", lid_1)
+        set_servo("BotRight", lid_4)
+        set_servo("TopRight", lid_2)
+        set_servo("BotLeft", lid_3)
+
+    # mruganie co kilka sekund
+    if time.time() - last_blink > next_blink:
+        blink()  
+        last_blink = time.time()  
+        next_blink = random.uniform(4, 8) 
+
+    #ruch szyi -                            DO POPRAWY!!!!
+    current_time = time.time()
+    left_right_angle = eye_x
+
+    if not neck_moving:
+        if left_right_angle < 20:
+            if neck_timer is None:
+                neck_timer = current_time
+            elif current_time - neck_timer > OFFSET_DELAY:
+                neck_moving = True
+                neck_move_start = current_time
+                neck_target = 1555  # w prawo
+        elif left_right_angle > 160:
+            if neck_timer is None:
+                neck_timer = current_time
+            elif current_time - neck_timer > OFFSET_DELAY:
+                neck_moving = True
+                neck_move_start = current_time
+                neck_target = 1455  # w lewo
+        else:
+            neck_timer = None
+
+    if neck_moving:
+        if neck_position < neck_target:
+            neck_position +=1
+        if neck_position > neck_target:
+            neck_position -= 1
+        pi.set_servo_pulsewidth(NECK_PIN, neck_position)
+
+    if current_time - neck_move_start > NECK_MOVE_DURATION:
+        pi.set_servo_pulsewidth(NECK_PIN, 1500)
+        neck_moving = False
+        neck_timer = None
+
+
+    # wyświetlanie obrazu do testów
+    cv2.imshow("Animatronic Eyes", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):  # wyjście po wciśnięciu 'q'
+        break
+
+cap.release()       
+cv2.destroyAllWindows()  
+calibrate()         
