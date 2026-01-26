@@ -1,0 +1,361 @@
+import os
+import json
+import datetime
+import threading
+import numpy as np
+import pyaudio
+import pygame
+import time
+from vosk import Model, KaldiRecognizer
+from google import genai
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# konfiguracja ścieżek
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
+
+# słownik kolorów spotkań
+COLOR_MAP = {
+    "lawendowy": "1", "niebieski": "2", "miętowy": "3", "różowy": "4",
+    "żółty": "5", "pomarańczowy": "6", "turkusowy": "7", "szary": "8",
+    "fioletowy": "9", "zielony": "10", "czerwony": "11"
+}
+
+# flagi stanów
+chat_history = []
+is_sleeping = False
+speaking = False
+
+# inicjalizacja modelu językowego
+try:
+    client = genai.Client()
+    print("Połączono z Gemini API")
+except Exception as e:
+    print(f"Błąd: {e}");
+    exit()
+
+# link do autoryzacji kalendarza
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+# funkcje kalendarza - dostępu, dodawanie spotkań, usuwanie spotkań, listowanie spotkań, dostęp do historii spotkań
+def get_calendar_service():
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, "w") as token:
+            token.write(creds.to_json())
+    return build("calendar", "v3", credentials=creds)
+
+
+def calendar_add_event(title, date, time, duration, color_name):
+    service = get_calendar_service()
+    c_id = COLOR_MAP.get(str(color_name).lower(), "1")
+    start_time = f"{date}T{time}:00"
+    try:
+        start_dt = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S")
+        dur = int(duration) if duration else 60
+        end_time = (start_dt + datetime.timedelta(minutes=dur)).strftime("%Y-%m-%dT%H:%M:%S")
+        event = {
+            "summary": title,
+            "start": {"dateTime": start_time, "timeZone": "Europe/Warsaw"},
+            "end": {"dateTime": end_time, "timeZone": "Europe/Warsaw"},
+            "colorId": c_id
+        }
+        service.events().insert(calendarId="primary", body=event).execute()
+        return True
+    except:
+        return False
+
+
+def calendar_list_events(date):
+    service = get_calendar_service()
+    s, e = f"{date}T00:00:00Z", f"{date}T23:59:59Z"
+    events = service.events().list(calendarId="primary", timeMin=s, timeMax=e, singleEvents=True,
+                                   orderBy="startTime").execute()
+    return events.get("items", [])
+
+
+def calendar_delete_event(title, date):
+    service = get_calendar_service()
+    s, e = f"{date}T00:00:00Z", f"{date}T23:59:59Z"
+    events = service.events().list(calendarId="primary", timeMin=s, timeMax=e, singleEvents=True).execute().get("items",
+                                                                                                                [])
+    deleted = 0
+    for ev in events:
+        if title.lower() in ev.get("summary", "").lower():
+            service.events().delete(calendarId="primary", eventId=ev["id"]).execute()
+            deleted += 1
+    return deleted
+
+
+def calendar_delete_all_day(date):
+    service = get_calendar_service()
+    s, e = f"{date}T00:00:00Z", f"{date}T23:59:59Z"
+    events = service.events().list(calendarId="primary", timeMin=s, timeMax=e, singleEvents=True).execute().get("items",
+                                                                                                                [])
+    for ev in events:
+        service.events().delete(calendarId="primary", eventId=ev["id"]).execute()
+    return len(events)
+
+
+def calendar_get_history(days_back=90):
+    try:
+        service = get_calendar_service()
+        now = datetime.datetime.now()
+        timeMin = (now - datetime.timedelta(days=days_back)).isoformat() + 'Z'
+        events = service.events().list(calendarId="primary", timeMin=timeMin, maxResults=40, singleEvents=True,
+                                       orderBy="startTime").execute()
+        items = events.get("items", [])
+        return ", ".join(
+            [f"{ev['summary']} ({ev['start'].get('dateTime', ev['start'].get('date'))[:10]})" for ev in items])
+    except:
+        return "Brak danych."
+
+# funckja dodana specjalnie na obronę dyplomu, aby podłączyć lepszej jakości mikrofon - jeżeli nieuzywana nalezy zakomentować
+def find_mic_index():
+    p_temp = pyaudio.PyAudio()
+    mic_id = None
+    for i in range(p_temp.get_device_count()):
+        info = p_temp.get_device_info_by_index(i)
+        if "Arctis" in info['name'] and info['maxInputChannels'] > 0:
+            mic_id = i
+            break
+    p_temp.terminate()
+    return mic_id
+
+ARCTIS_ID = find_mic_index()
+if ARCTIS_ID is not None:
+    print(f"Znaleziono mikrofon Arctis na indexie: {ARCTIS_ID}")
+else:
+    print("Nie znaleziono")
+
+# Inicjalizacja modelu Vosk
+model_vosk = Model("/home/Jan/vosk/model-pl") # Zmieniłem nazwę zmiennej, bo 'model' koliduje z Gemini
+recognizer = KaldiRecognizer(model_vosk, 48000)
+
+p = pyaudio.PyAudio()
+
+# Otwieramy strumień z konkretnym ID urządzenia i wymuszamy mono 16kHz
+stream = p.open(
+    format=pyaudio.paInt16,
+    channels=1,
+    rate=48000, #zmienić na 16000 w przpyadku słuchawek nie wymagających 48000
+    input=True,
+    input_device_index=ARCTIS_ID, # TO JEST KLUCZOWE
+    frames_per_buffer=8000 # Większy bufor dla stabilności na RPi
+)
+stream.start_stream()
+
+
+# funckje mowy oraz logika i zasady systemowe modelu Gemini
+def speak(text):
+    global speaking
+    speaking = True
+    stream.stop_stream()
+    os.system(f'espeak-ng -v pl "{text}"')
+    time.sleep(0.2)
+    recognizer.Reset()
+    stream.start_stream()
+
+    speaking = False
+
+
+def ask_gemini(user_text):
+    global chat_history
+
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M")
+    history_context = calendar_get_history(90)
+
+    sys_instr = f"""
+Jesteś KALBOTEM – inteligentnym asystentem Jana, studenta mechatroniki na Politechnice Poznańskiej.
+Twoim głównym zadaniem jest zarządzanie kalendarzem, ale jesteś też ciekawym rozmówcą.
+Dzisiaj jest {today}, godzina {current_time}.
+
+ZASADY I INTENCJE:
+1. ROZMOWA (intent: "NONE"): Jeśli Jan się wita, żartuje, pyta o ciekawostki (np. o mechatronikę) lub po prostu rozmawia – odpowiadaj swobodnie, inteligentnie i z osobowością. Nie szukaj wtedy dat ani tytułów.
+
+2. DODAWANIE (intent: "ADD_EVENT"): Użyj tej intencji TYLKO, gdy Jan użyje zwrotów typu: "dodaj", "zaplanuj", "utwórz", "zapisz", "wpisz", "ustaw spotkanie". 
+   - Musisz wyodrębnić: tytuł, datę (YYYY-MM-DD) i godzinę (HH:MM).
+
+3. LISTOWANIE (intent: "LIST_EVENTS"): Gdy Jan pyta: "co mam w planie", "co dzisiaj robię", "pokaż kalendarz", "jakie mam spotkania".
+
+4. USUWANIE (intent: "DELETE_EVENT"): Gdy Jan mówi: "usuń", "wykasuj", "anuluj spotkanie". "DELETE_ALL_DAY" kiedy Jan mówi, żeby usunąć cały dzień lub wyczyścić ze spotkań.
+
+5. KONTEKST KALENDARZA: Twoja aktualna wiedza o wydarzeniach: {history_context}. Na podstawie, której oraz swoich pomysłów możesz zaproponować, gdy pyta cie o pomoc.
+
+PAMIĘTAJ: 
+- Jeśli Jan mówi o czymś ogólnie (np. "Muszę się kiedyś pouczyć"), nie dodawaj tego do kalendarza. Dodawaj tylko, gdy padnie konkretne polecenie "zapisz" lub "dodaj".
+- Odpowiadaj naturalnie – jeśli dodasz wydarzenie, powiedz np. "Jasne Janie, zapisałem kolokwium na jutro".
+
+ZASADY DODAWANIA:
+1. Kolory: Masz do wyboru: lawendowy, niebieski, miętowy, różowy, żółty, pomarańczowy, turkusowy, szary, fioletowy, zielony, czerwony. Jeśli Jan nie poda koloru, ustaw zielony.
+2. Godzina: Zawsze podawaj dokładnie taką godzinę, o jaką prosi Jan. Jeśli mówi "na 20:00", w JSON wpisz "20:00". Nie zmieniaj jej na aktualną godzinę chyba, że o to prosi.
+3. Obliczenia: Jeśli jest {current_time}, a Jan mówi "za dwie godziny", oblicz to matematycznie.
+4. Czas trwania: Jeśli Jan nie poda jak długo trwa spotkanie, ustaw domyślnie 60 minut. Jeśli poda (np. "pół godziny", "dwie godziny"), przelicz to na minuty.
+5. Jeśli Jan prosi o poprawkę ostatniego spotkania, najpierw ustaw intent na DELETE_EVENT dla starego wpisu, a potem dodaj nowe spotkanie ADD_EVENT, o którym mówi Jan.
+
+ZASADY DOTYCZĄCE HISTORII:
+1. Jeśli ostatnia akcja (ADD_EVENT, DELETE itp.) została już wykonana i potwierdzona w historii, a Jan mówi "dziękuję", "super", "ok" lub chwali Cię - ustaw intent na "NONE" i po prostu uprzejmie odpowiedz. 
+2. NIE powtarzaj akcji, która już widnieje w historii jako wykonana.
+3. Jeśli Jan nie podaje nowych danych do kalendarza, nie próbuj na siłę ich szukać.
+"""
+    # filtracja historii
+    messages = chat_history[-10:] if len(chat_history) > 0 else []
+    messages.append({"role": "user", "parts": [{"text": user_text}]})
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=messages,
+            config={
+                "system_instruction": sys_instr,
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "response_mime_type": "application/json",
+                "response_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "intent": {"type": "string",
+                                   "enum": ["ADD_EVENT", "LIST_EVENTS", "DELETE_EVENT", "DELETE_ALL_DAY", "NONE"]},
+                        "title": {"type": "string"},
+                        "date": {"type": "string"},
+                        "time": {"type": "string"},
+                        "duration_minutes": {"type": "integer"},
+                        "color": {"type": "string"}
+                    },
+                    "required": ["reply", "intent"]
+                }
+            }
+        )
+
+        res_json = json.loads(response.text)
+
+
+        chat_history.append({"role": "user", "parts": [{"text": user_text}]})
+        chat_history.append({"role": "model", "parts": [{"text": res_json["reply"]}]})
+
+        if len(chat_history) > 14:  # 7 par rozmów
+            chat_history = chat_history[-14:]
+
+        return res_json
+
+    except Exception as e:
+        print("Błąd Gemini:", e)
+        return {"reply": "Przepraszam, mam problem z połączeniem.", "intent": "NONE"}
+
+
+# główna pętla asystenta
+def listen_loop():
+    global is_sleeping
+    print("KALBOT aktywny.")
+
+    while True:
+        #inicjalizacja modułu rozpoznawania mowy
+        data = stream.read(8000, exception_on_overflow=False)
+
+        if speaking:
+            recognizer.Reset()
+            continue
+
+        if recognizer.AcceptWaveform(data):
+            res = json.loads(recognizer.Result())
+            text = res.get("text", "").strip().lower()
+            if text in ["zzz", "zz","z","st","z z z","z z"]:
+                continue
+            if text.startswith("trzy"):
+                continue
+            if not text:
+                continue
+
+            print(f"Jan: {text}")
+
+            # logika uśpienia
+            if is_sleeping:
+                if any(phrase in text for phrase in ["obudź się", "potrzebuję cię", "wstań"]):
+                    is_sleeping = False
+                    speak("Jestem, Janie. W czym mogę pomóc?")
+                continue
+
+            if any(phrase in text for phrase in ["idź spać", "idź się przespać", "odpocznij"]):
+                is_sleeping = True
+                speak("Zrozumiałem. Przechodzę w tryb czuwania. Daj znać, gdy będę potrzebny.")
+                continue
+
+            # procesowanie przez AI
+            ai = ask_gemini(text)
+            reply = ai.get("reply")
+            intent = ai.get("intent")
+
+            try:
+                if intent == "ADD_EVENT" and ai.get("title") and ai.get("date"):
+                    calendar_add_event(ai["title"], ai["date"], ai.get("time"), ai.get("duration_minutes",60),
+                                       ai.get("color","zielony"))
+                elif intent == "DELETE_EVENT" and ai.get("title") and ai.get("date"):
+                    calendar_delete_event(ai["title"], ai["date"])
+                elif intent == "DELETE_ALL_DAY" and ai.get("date"):
+                    calendar_delete_all_day(ai["date"])
+                elif intent == "LIST_EVENTS" and ai.get("date"):
+                    evs = calendar_list_events(ai["date"])
+                    if evs:
+                        details = ", ".join([f"{x['summary']} o {x['start'].get('dateTime', '')[11:16]}" for x in evs])
+                        reply = f"Twoje plany na {ai['date']}: {details}."
+                    else:
+                        reply = f"Dzień {ai['date']} jest wolny."
+            except Exception as e:
+                print(f"Błąd: {e}")
+
+            speak(reply)
+
+
+# inicjalizacja wątków
+threading.Thread(target=listen_loop, daemon=True).start()
+
+# inicjalizacja pygame
+pygame.init()
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+w, h = screen.get_size()
+clock = pygame.time.Clock()
+amp = 20
+
+# pętla nr 2 od PyGame
+while True:
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT: exit()
+
+    screen.fill((0, 0, 0))
+
+    if speaking:
+        target_amp = 60
+        noise_level = 1.0
+        line_color = (0, 255, 0)
+    elif is_sleeping:
+        target_amp = 2
+        noise_level = 0.2
+        line_color = (0, 191, 255)
+    else:
+        target_amp = 10
+        noise_level = 1.0
+        line_color = (0, 200, 0)
+
+    amp += (target_amp - amp) * 0.1
+
+    noise = np.random.normal(0, amp * noise_level, w)
+    pts = [(i, int(h / 2 + noise[i])) for i in range(w)]
+
+    pygame.draw.lines(screen, line_color, False, pts, 2)
+    pygame.display.flip()
+    clock.tick(60)
