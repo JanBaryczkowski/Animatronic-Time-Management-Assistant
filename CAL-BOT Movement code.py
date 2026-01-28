@@ -159,8 +159,8 @@ lid_1 = 30  # TopLeft
 lid_2 = 150  # TopRight
 lid_3 = 120  # BotLeft
 lid_4 = 60  # BotRight
-DEADZONE_Y = 12  # piksele
-DEADZONE_X = 10
+DEADZONE_Y = 30  # piksele
+DEADZONE_X = 15
 OFFSET_X = -50
 OFFSET_Y = 20
 last_blink = time.time()
@@ -171,16 +171,16 @@ Kp = 0.040
 Kd = 0.025
 prev_error_x = 0
 prev_error_y = 0
-smoothing = 1.0
+smoothing = 1
 # parametry obrotu głowy
 pi.set_servo_pulsewidth(NECK_PIN, 1500)
 NECK_STOP = 1500
-NECK_LEFT = 1550  # skręt w lewo (im bliżej 1500 tym wolniej)
-NECK_RIGHT = 1450  # skręt w prawo
+NECK_LEFT = 1570  # skręt w lewo (im bliżej 1500 tym wolniej)
+NECK_RIGHT = 1430  # skręt w prawo
 EYE_LEFT_THRESHOLD = 70
 EYE_RIGHT_THRESHOLD = 110
 current_neck_value = NECK_STOP
-STEP_SIZE_UP = 5  # o ile zmieniamy wartość w każdym kroku
+STEP_SIZE_UP = 10 # o ile zmieniamy wartość w każdym kroku
 STEP_SIZE_DOWN = 10
 
 calibrate()
@@ -319,3 +319,4 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 calibrate()
+
