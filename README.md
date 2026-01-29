@@ -8,4 +8,4 @@ for mechanical control and assistant functionality. CAL-BOT utilizes the Gemini 
 age model for natural language processing, enabling fluent conversation and intelligent schedule
 management through voice commands.
 
-[![Demo video](assets/Picture%20of%20CAL-BOT%20(IRL).jpg)](https://www.youtube.com/watch?v=TbGypQZrm38)
+[![Demo video](assets/picture_of_cal_bot_irl.jpg)](https://www.youtube.com/watch?v=TbGypQZrm38)
